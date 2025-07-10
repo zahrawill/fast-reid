@@ -1,6 +1,30 @@
 import cv2 as cv
 from ultralytics import YOLO
 import numpy as np
+import torch
+
+from fastreid.config import get_cfg
+from fastreid.engine import DefaultPredictor
+
+
+class FastReIDExtractor:
+    """Helper for extracting features with FastReID."""
+
+    def __init__(self, cfg_path: str, weight_path: str):
+        cfg = get_cfg()
+        cfg.merge_from_file(cfg_path)
+        cfg.merge_from_list(["MODEL.WEIGHTS", weight_path])
+        cfg.freeze()
+        self.cfg = cfg
+        self.predictor = DefaultPredictor(cfg)
+
+    def __call__(self, image_bgr: np.ndarray):
+        # FastReID expects RGB images
+        image = image_bgr[:, :, ::-1]
+        image = cv.resize(image, tuple(self.cfg.INPUT.SIZE_TEST[::-1]), interpolation=cv.INTER_CUBIC)
+        tensor = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))[None]
+        feat = self.predictor(tensor)
+        return feat.squeeze(0).cpu() #.numpy() to return array
 
 #to configure reid: "anaconda3\Lib\site-packages\ultralytics\cfg\trackers\botsort.yaml"
 
@@ -37,10 +61,22 @@ def find_closest_keypoints(center, keypoints_data):
     return best_keypoints
 
 #Person tracking and pose estimation
-def transform_real_time(video_path):
-    #Load tracking, pose estimation, and ReID models
+def transform_real_time(video_path, cfg_path, weight_path):
+    """Run tracking and pose estimation on ``video_path`` and extract reid features.
+
+    Args:
+        video_path (str): path or url to video source.
+        cfg_path (str): FastReID config file path.
+        weight_path (str): path to model weights.
+
+    Returns:
+        Tuple[list[np.ndarray], list[np.ndarray]]: list of cropped images and
+        their corresponding feature vectors.
+    """
+    # Load tracking, pose estimation, and ReID models
     detect_model = YOLO("yolo11n.pt")
     pose_model = YOLO("yolo11n-pose.pt")
+    reid_extractor = FastReIDExtractor(cfg_path, weight_path)
 
     cap = cv.VideoCapture(video_path)
     if not cap.isOpened():
@@ -51,6 +87,7 @@ def transform_real_time(video_path):
     frame_number = 0
     tracked_objects = {}
     crops = []
+    features = []
     cv.namedWindow("Detection + Pose Frame", cv.WINDOW_NORMAL)
     while True:
         ret, frame = cap.read()
@@ -69,8 +106,8 @@ def transform_real_time(video_path):
         pose_results = pose_model(frame)
 
         #Combine visualization: draw pose results on top of detection frame
-        annotated_frame = pose_results[0].plot()  # Pose visualized here
-        #annotated_frame = results[0].plot()
+        #annotated_frame = pose_results[0].plot()  #pose visualization  
+        annotated_frame = results[0].plot() #tracking visualization
 
         #Process each tracked detection
         if results[0].boxes is not None:
@@ -86,7 +123,7 @@ def transform_real_time(video_path):
                 box = detection.xyxy.cpu().numpy()[0]
                 center = get_center(box)
 
-                best_kps = find_closest_keypoints(center, pose_results[0].keypoints)
+                best_kps = find_closest_keypoints(center, pose_results[0].keypoints) #could be helpful for
                 if best_kps is None:
                     continue
 
@@ -102,7 +139,11 @@ def transform_real_time(video_path):
 
                     # skip impossible boxes
                     if x2 > x1 and y2 > y1:
-                        crops.append(frame[y1:y2, x1:x2].copy())      # isolate the patch
+                        crop_img = frame[y1:y2, x1:x2].copy()
+                        crops.append(crop_img)
+                        # extract feature of this cropped image
+                        features.append(reid_extractor(crop_img))
+
                     tracked_objects[obj_id] = TrackedObject(center, obj_id, timestamp, best_kps)
 
         # Show combined pose + detection overlay
@@ -113,14 +154,18 @@ def transform_real_time(video_path):
 
     cap.release()
     cv.destroyAllWindows()
-    return crops
+    return crops, features
 
+'''RUN IN TERMINAL WITH python3 -m mobreid.processing '''
 if __name__ == '__main__':
-    vpath = r"4min12fps_300clemantis.mp4"
+    vpath = r"mobreid/4min12fps_300clemantis.mp4"
     rtsp = r"rtsp://admin:Zarpoolo01!@192.168.50.94:554/"
     rtmp = r"rtmp://192.168.50.94/bcs/channel0_sub.bcs?channel=0&stream=0&user=admin&password=Zarpoolo01!"
-    crops = []
-    crops = transform_real_time(rtmp)
-    cv.imshow("img crop", crops[0])
-    cv.waitKey(0)
+    cfg_file = "logs/market1501/mgn_R50-ibn/config.yaml"  # example config
+    weight_file = "logs/market1501/mgn_R50-ibn/model_final.pth"  # path to pretrained weights
+    crops, features = transform_real_time(vpath, cfg_file, weight_file)
+    '''if crops:
+        cv.imshow("img crop", crops[1]) #print first img crop
+        cv.waitKey(0)
     cv.destroyAllWindows()
+    print(features[1]) #print feature vector of first img crop'''
